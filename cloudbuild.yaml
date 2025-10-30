@@ -1,0 +1,80 @@
+options:
+  logging: CLOUD_LOGGING_ONLY
+  pool:
+    name: "projects/${PROJECT_ID}/locations/${LOCATION}/workerPools/${_PRIVATEPOOL_NAME}"
+
+steps:
+  # 1. Build the Docker image
+  - id: "build"
+    name: "gcr.io/cloud-builders/docker"
+    env:
+      - "DOCKER_BUILDKIT=1"
+    args:
+      - "build"
+      - "--platform=linux/amd64"
+      - "-t"
+      - "${LOCATION}-docker.pkg.dev/${PROJECT_ID}/${_REPOSITORY_NAME}/${_IMAGE}:latest"
+      - "-f"
+      - "${_DOCKERFILE}"
+      - "."
+
+  # 2. Push it
+  - name: 'gcr.io/cloud-builders/docker'
+    id: 'Push'
+    args:
+    - 'push'
+    - '--all-tags'
+    - '${LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY_NAME}/${_IMAGE}'
+  
+    # 3. Capture the image digest
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'Get Image Digest'
+    entrypoint: 'bash'
+    args:
+    - '-c'
+    - |
+      set -e # Exit immediately on error
+      gcloud artifacts docker images describe \
+        '${LOCATION}-docker.pkg.dev/$PROJECT_ID/${_REPOSITORY_NAME}/${_IMAGE}:latest' \
+        --format='get(image_summary.fully_qualified_digest)' > /workspace/image-digest
+
+  # 4. create attestation
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'Sign-and-Attest'
+    entrypoint: 'bash'
+    args:
+    - '-c'
+    - |
+      set -euxo pipefail
+      
+      echo "--- 1. Creating signature payload..."
+      gcloud beta container binauthz create-signature-payload \
+        --artifact-url="$(cat /workspace/image-digest)" > /workspace/generated_payload.json
+
+      echo "--- 2. Signing payload with KMS..."
+      gcloud kms asymmetric-sign \
+        --project="${PROJECT_ID}" \
+        --location="${LOCATION}" \
+        --keyring="${_KMS_KEYRING_NAME}" \
+        --key="${_KMS_KEY_NAME}" \
+        --version="1" \
+        --digest-algorithm="sha256" \
+        --input-file="/workspace/generated_payload.json" \
+        --signature-file="/workspace/signature.bin"
+
+      echo "--- 3. Fetching Public Key ID from attestor..."
+      PUBLIC_KEY_ID=$(gcloud beta container binauthz attestors describe ${_ATTESTOR_NAME} \
+        --project="${PROJECT_ID}" \
+        --format='get(userOwnedDrydockNote.publicKeys[0].id)')
+      
+      echo "--- Found Public Key ID: $${PUBLIC_KEY_ID}"
+
+      echo "--- 4. Creating attestation..."
+      gcloud beta container binauthz attestations create \
+        --project="${PROJECT_ID}" \
+        --artifact-url="$(cat /workspace/image-digest)" \
+        --attestor="projects/${PROJECT_ID}/attestors/${_ATTESTOR_NAME}" \
+        --signature-file="/workspace/signature.bin" \
+        --public-key-id="$${PUBLIC_KEY_ID}"
+
+      echo "--- Attestation created successfully!"

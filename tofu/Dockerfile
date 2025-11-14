@@ -16,5 +16,5 @@ RUN apk add --no-cache bash
 # Tell the container that 'tofu' is the command to run
 ENTRYPOINT ["/usr/local/bin/tofu"]
 
-# Set the default working directory
+# Set up the default working directory
 WORKDIR /workspace
